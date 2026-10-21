@@ -1,0 +1,25 @@
+services:
+  mysql:
+    image: mysql:8.0
+    environment:
+      MYSQL_ROOT_PASSWORD: root
+      MYSQL_DATABASE: seckill
+      MYSQL_USER: seckill        # 业务账号: 只拥有 seckill 库的权限, 应用不直接用 root
+      MYSQL_PASSWORD: seckill
+    ports:
+      - "3306:3306"
+    volumes:
+      - mysql-data:/var/lib/mysql                              # 数据持久化
+      - ./sql/init.sql:/docker-entrypoint-initdb.d/init.sql    # 首次启动时自动建表
+
+  redis:
+    image: redis:7
+    command: redis-server --appendonly yes                     # 开启 AOF 持久化
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+
+volumes:
+  mysql-data:
+  redis-data:

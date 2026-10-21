@@ -1,0 +1,176 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>秒杀并发演示</title>
+  <style>
+    body { max-width: 920px; margin: 32px auto; padding: 0 16px; font-family: -apple-system, "PingFang SC", sans-serif; color: #18181b; background: #fafafa; }
+    h1 { font-size: 22px; margin: 0 0 16px; }
+    .card { background: #fff; border: 1px solid #e4e4e7; border-radius: 12px; padding: 16px 20px; margin-bottom: 16px; }
+    .big { font-size: 28px; font-weight: 700; }
+    .negative { color: #ef4444; }
+    .bar { height: 14px; margin-top: 12px; background: #e4e4e7; border-radius: 7px; overflow: hidden; }
+    #bar { height: 100%; background: #22c55e; transition: width 0.5s; }
+    .controls { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+    select, input, button { font: inherit; padding: 6px 12px; border: 1px solid #d4d4d8; border-radius: 6px; background: #fff; }
+    button { background: #18181b; border-color: #18181b; color: #fff; cursor: pointer; }
+    button:disabled { opacity: 0.4; cursor: default; }
+    input { width: 72px; }
+    .hint { margin: 10px 0 0; font-size: 14px; color: #71717a; }
+    #verdict { margin: 0 0 12px; font-size: 16px; font-weight: 600; }
+    #grid { display: flex; flex-wrap: wrap; gap: 3px; min-height: 20px; }
+    .cell { display: inline-block; width: 12px; height: 12px; border-radius: 3px; }
+    #grid .cell { animation: pop 0.3s both; }
+    @keyframes pop { from { transform: scale(0); } }
+    .ok { background: #22c55e; }
+    .sold { background: #d4d4d8; }
+    .dup { background: #facc15; }
+    .fail { background: #ef4444; }
+    .legend { display: flex; gap: 6px; align-items: center; margin-top: 12px; font-size: 13px; color: #71717a; }
+    table { width: 100%; border-collapse: collapse; font-size: 14px; }
+    th, td { padding: 6px 8px; text-align: right; border-bottom: 1px solid #e4e4e7; }
+    th:first-child, td:first-child { text-align: left; }
+  </style>
+</head>
+<body>
+  <h1>秒杀并发演示</h1>
+
+  <div class="card">
+    <div>剩余库存 <span class="big" id="stock">-</span> / <span id="total">-</span> · 订单 <b id="orders">-</b></div>
+    <div class="bar"><div id="bar"></div></div>
+  </div>
+
+  <div class="card">
+    <div class="controls">
+      <select id="strategy"></select>
+      <label>请求数 <input id="requests" type="number" value="500" min="2" max="2000" /></label>
+      <button id="rush">同时抢购</button>
+      <button id="once">我来抢一次</button>
+      <button id="all">一键对比全部策略</button>
+      <button id="reset">重置</button>
+    </div>
+    <p class="hint" id="desc"></p>
+    <p class="hint">同时抢购会先把库存重置为初始值. 每个用户相邻发出两次请求, 模拟手抖连点.</p>
+  </div>
+
+  <div class="card">
+    <p id="verdict">选择策略后点「同时抢购」或「一键对比全部策略」开始</p>
+    <div id="grid"></div>
+    <div class="legend">
+      <span class="cell ok"></span>成功
+      <span class="cell sold"></span>售罄
+      <span class="cell dup"></span>重复 (被唯一索引或 Lua 拦下)
+      <span class="cell fail"></span>失败 (乐观锁重试耗尽或报错)
+    </div>
+  </div>
+
+  <div class="card">
+    <table>
+      <thead>
+        <tr><th>策略</th><th>成功</th><th>售罄</th><th>重复</th><th>失败</th><th>订单</th><th>剩余库存</th><th>结论</th><th>耗时(ms)</th></tr>
+      </thead>
+      <tbody id="history"></tbody>
+    </table>
+  </div>
+
+  <script>
+    const $ = (id) => document.getElementById(id);
+    // 策略清单 (名称、显示名、说明) 全部来自服务端 GET /strategies
+    let STRATEGIES = [];
+    const DESC = {};
+    // 结果到方块颜色的映射, 其余结果 (BUSY / ERROR) 显示为红色 fail
+    const CELL = { OK: 'ok', SOLD_OUT: 'sold', DUPLICATE: 'dup' };
+    const ONCE_MSG = { OK: '抢到了', SOLD_OUT: '已售罄', DUPLICATE: '你已经买过了, 重复下单被拦截', BUSY: '乐观锁重试耗尽, 没抢到, 再试一次', ERROR: '服务端出错' };
+
+    const post = (url, body = {}) =>
+      fetch(url, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) }).then((r) => r.json());
+    const getStats = (waitFor = 0) => fetch(`/stats?waitFor=${waitFor}`, { cache: 'no-store' }).then((r) => r.json());
+    const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+    function paintStock({ stock, orders, initialStock }) {
+      $('stock').textContent = stock;
+      $('stock').classList.toggle('negative', stock < 0);
+      $('total').textContent = initialStock;
+      $('orders').textContent = orders;
+      $('bar').style.width = `${(Math.max(stock, 0) / initialStock) * 100}%`;
+    }
+
+    // 同一时刻的抢购: 结果以方块逐个亮起, 最后汇总成结论并追加到对比表
+    async function rush(strategy, requests) {
+      await post('/reset');
+      const userIds = Array.from({ length: requests }, (_, i) => `u${Math.floor(i / 2)}`);
+      const start = performance.now();
+      const results = await post(`/burst/${strategy}`, { userIds });
+      $('grid').replaceChildren(...results.map((r, i) => {
+        const cell = document.createElement('span');
+        cell.className = `cell ${CELL[r.result] ?? 'fail'}`;
+        cell.style.animationDelay = `${i * 2}ms`;
+        return cell;
+      }));
+
+      const count = (result) => results.filter((r) => r.result === result).length;
+      const okCount = count('OK');
+      // 服务端会等到订单数追上成功数再返回, 避免 redis 策略的异步落库还没写完就判定
+      const stats = await getStats(okCount);
+      paintStock(stats);
+
+      const elapsed = Math.round(performance.now() - start);
+      $('verdict').textContent = `${stats.verdict}: 卖出 ${stats.orders} 单, 初始库存 ${stats.initialStock}, 剩余 ${stats.stock}`;
+      $('history').insertAdjacentHTML('beforeend', `<tr><td>${strategy}</td><td>${okCount}</td><td>${count('SOLD_OUT')}</td><td>${count('DUPLICATE')}</td><td>${count('BUSY') + count('ERROR')}</td><td>${stats.orders}</td><td>${stats.stock}</td><td>${stats.verdict}</td><td>${elapsed}</td></tr>`);
+    }
+
+    // 单人抢购: 每次用一个新用户, 连续点击可以看到售罄
+    async function buyOnce(strategy) {
+      const userId = `visitor-${Math.random().toString(36).slice(2, 8)}`;
+      const { result } = await post(`/buy/${strategy}`, { userId });
+      await sleep(300); // 给 redis 策略的 worker 一点落库时间
+      paintStock(await getStats());
+      $('verdict').textContent = `这一次: ${ONCE_MSG[result]}`;
+    }
+
+    // 同一时间只跑一个任务, 运行中禁用所有按钮, 避免两个任务同时重置数据
+    async function task(fn) {
+      document.querySelectorAll('button').forEach((b) => (b.disabled = true));
+      try {
+        await fn();
+      } catch (e) {
+        $('verdict').textContent = `出错了: ${e.message}`;
+      } finally {
+        document.querySelectorAll('button').forEach((b) => (b.disabled = false));
+      }
+    }
+
+    const requests = () => Math.min(Number($('requests').value) || 500, 2000);
+    const showDesc = () => ($('desc').textContent = DESC[$('strategy').value]);
+
+    $('strategy').onchange = showDesc;
+    $('rush').onclick = () => task(() => rush($('strategy').value, requests()));
+    $('once').onclick = () => task(() => buyOnce($('strategy').value));
+    $('all').onclick = () => task(async () => {
+      for (const s of STRATEGIES) await rush(s, requests());
+    });
+    $('reset').onclick = () => task(async () => {
+      await post('/reset');
+      $('grid').replaceChildren();
+      $('history').replaceChildren();
+      $('verdict').textContent = '已重置';
+      paintStock(await getStats());
+    });
+
+    // 从服务端加载策略清单, 填充下拉框和说明
+    async function loadStrategies() {
+      const list = await fetch('/strategies').then((r) => r.json());
+      STRATEGIES = list.map((s) => s.name);
+      $('strategy').replaceChildren(...list.map((s) => new Option(`${s.name} ${s.label}`, s.name)));
+      list.forEach((s) => (DESC[s.name] = s.desc));
+      showDesc();
+    }
+
+    task(async () => {
+      await loadStrategies();
+      paintStock(await getStats());
+    });
+  </script>
+</body>
+</html>
